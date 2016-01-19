@@ -1,0 +1,343 @@
+#!/usr/bin/perl
+#------------------------------------------------------------------------
+# J.Kildea 1-FEB-2013 
+#------------------------------------------------------------------------
+# PERL-CGI-DBI script to put DVH data into the DVHDB MySQL database at the MUHC 
+# 
+# Input parameters: 	various	
+#------------------------------------------------------------------------
+# Declarations/initialisations
+#------------------------------------------------------------------------
+use strict;
+#use warnings;
+#use diagnostics;
+#use CGI qw(:standard);
+#use CGI::Carp qw(fatalsToBrowser);
+
+#------------------------------------------------------------------------
+# Use the DBI module 
+#------------------------------------------------------------------------
+use DBI;
+use DBD::Sybase;
+use Date::Calc;
+#use Date::Calc qw( Standard_to_Business Today Business_to_Standard );  
+use Date::Calc qw(Decode_Month Today Now Decode_Date_US Today_and_Now Delta_DHMS Add_Delta_Days Delta_Days);  
+
+#------------------------------------------------------------------------
+# Important variables
+#------------------------------------------------------------------------
+my $help;
+my $dvhfile;
+my $skipline;
+my $line;
+my @cols;
+my $PatientSer;
+my $PlanSer;
+my $Diagnosis = "Prostate Ca"; # for now...
+
+#------------------------------------------------------------------------
+# Read in the command line arguments
+#------------------------------------------------------------------------
+use Getopt::Long;
+&GetOptions("h"	     => \$help,
+	    "help"   => \$help,
+	    "dvhfile=s" => \$dvhfile,
+	   );
+
+#------------------------------------------------------------------------
+# Process the command line input
+# if there are no command line arguments then say so and die!
+#------------------------------------------------------------------------
+if ($help || !$dvhfile || (!$help && !$dvhfile))
+{
+die "DVH_insert: too few arguments\n
+
+Usage:
+	DVH_insert --dvhfile=filename
+		\n";
+}
+
+#------------------------------------------------------------------------
+# Connect to the MUHC MySQL database 
+#------------------------------------------------------------------------
+my $muhcdb_host="localhost";
+my $muhcdb_database="DVHDB";
+my $muhcdb_user="readonly";
+my $muhcdb_password="readonly";
+
+my $dbh_mysql =  DBI->connect("DBI:mysql:database=$muhcdb_database;host=$muhcdb_host",$muhcdb_user,$muhcdb_password)
+    or die "Couldn't connect to database: " . DBI->errstr;
+
+#------------------------------------------------------------------------
+# Read in the DVH data
+#------------------------------------------------------------------------
+open(DVHDATA, "$dvhfile") || die "file $dvhfile does not exist";
+
+
+my ($PatientId, $NonStandardId, $PrescDose, $PercentIso, $NonStandardId, $CourseId, $skipline);
+my ($VolumeCC,$DoseCoverPercent,$SamplingCoverPercent,$MinDoseGy,$MaxDoseGy,$MeanDoseGy,$ModalDoseGy,$MedianDoseGy,$STDDoseGy); 
+my ($DoseGy,$RelativeDose,$PercentVol);
+
+readHeader();
+readDVH();
+
+#------------------------------------------------------------------------
+# Function to read a header line
+#------------------------------------------------------------------------
+sub readHeader
+{
+  # Read the header
+  $skipline = <DVHDATA>; # skip the patient name
+  $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $PatientId = trim($cols[1]); #Patient Id as PatientId
+  $skipline = <DVHDATA>; # skip comment 
+  $skipline = <DVHDATA>; # skip date
+  $skipline = <DVHDATA>; # skip type
+  $skipline = <DVHDATA>; # skip desc 1
+  $skipline = <DVHDATA>; # skip desc 2
+  $skipline = <DVHDATA>; # skip desc 3
+  $skipline = <DVHDATA>; # blank line 
+  $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $NonStandardId = trim($cols[1]); #plan name
+  $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $PrescDose = trim($cols[1]); #Presc Dose
+  $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $PercentIso = trim($cols[1]); #Presc Isodose line
+  $skipline = <DVHDATA>; # blank line 
+
+  #print "PatientId: $PatientId\n";
+  #print "Plan name: $NonStandardId\n";
+  #print "Prescribed Dose (Gy): $PrescDose\n";
+  #print "%Iso: $PercentIso\n";
+
+  #------------------------------------------------------------------------
+  # Check if this patient already has an entry in the database - if not then add him/her
+  # Note: using ARIA IDs only for confidentiality
+  #------------------------------------------------------------------------
+  my $PatientSQL = "
+	SELECT
+		PatientSer 
+	FROM
+		Patient
+	WHERE
+		Patient.PatientId = \"$PatientId\"
+  ";
+  #print "SQL: $PatientSQL\n";
+
+  # prepare query
+  my $query= $dbh_mysql->prepare($PatientSQL)
+    or die "Couldn't prepare statement: " . $dbh_mysql->errstr;
+
+  # submit query
+  $query->execute()
+    or die "Couldn't execute statement: " . $query->errstr;
+
+  # retrieve the PatientSer, assuming it exists
+  $PatientSer = $query->fetchrow_array();
+
+  #print "PatientSer: $PatientSer\n";
+
+  # If PatientSer is blank then patient not already in DB, so add
+  if(!$PatientSer)
+  {
+    #print "PatientSer does not exist... so will add new patient\n";
+
+    # prepare SQL
+    my $InsertPatientSQL = "INSERT INTO Patient (PatientId,Diagnosis,PatientSer) VALUES (\"$PatientId\",\"$Diagnosis\",NULL)"; 
+    #print "InsertPatientSQL: $InsertPatientSQL\n";
+
+    # prepare query
+    my $query= $dbh_mysql->prepare($InsertPatientSQL)
+      or die "Couldn't prepare statement: " . $dbh_mysql->errstr;
+
+    # submit query
+    $query->execute()
+      or die "Couldn't execute statement: " . $query->errstr;
+
+    # Now retrieve the PatientSer
+    $PatientSer = $dbh_mysql->last_insert_id(undef, undef, undef, undef);
+  }
+  #print "PatientSer: $PatientSer\n";
+
+  #------------------------------------------------------------------------
+  #Insert plan into DB, if not already there for this patient 
+  #------------------------------------------------------------------------
+  my $PlanSQL = "
+	SELECT
+		PlanSer 
+	FROM
+		Plan	
+	WHERE
+		PatientSer = \"$PatientSer\"
+		AND NonStandardId = \"$NonStandardId\"
+  ";
+  #print "SQL: $PlanSQL\n";
+
+  # prepare query
+  my $query= $dbh_mysql->prepare($PlanSQL)
+    or die "Couldn't prepare statement: " . $dbh_mysql->errstr;
+
+  # submit query
+  $query->execute()
+    or die "Couldn't execute statement: " . $query->errstr;
+
+  # retrieve the PlanSer, assuming it exists
+  $PlanSer = $query->fetchrow_array();
+
+  #print "PlanSer: $PlanSer\n";
+ 
+  # If PlanSer is blank then patient not already in DB, so add
+  if(!$PlanSer)
+  {
+    #print "PlanSer does not exist... so will add new patient\n";
+
+    # prepare SQL
+    my $InsertPlanSQL = "INSERT INTO Plan (PatientSer, PlanSer, NonStandardId, PrescDose, PercentIso) VALUES (\"$PatientSer\",NULL,\"$NonStandardId\",\"$PrescDose\",\"PercentIso\")"; 
+    #print "InsertPlanSQL: $InsertPlanSQL\n";
+
+    # prepare query
+    my $query= $dbh_mysql->prepare($InsertPlanSQL)
+      or die "Couldn't prepare statement: " . $dbh_mysql->errstr;
+
+    # submit query
+    $query->execute()
+      or die "Couldn't execute statement: " . $query->errstr;
+
+    # Now retrieve the PlanSer
+    $PlanSer = $dbh_mysql->last_insert_id(undef, undef, undef, undef);
+  }
+  else
+  {
+    die "Plan \"$NonStandardId\" for Patient \"$PatientId\" is already in the database --- not inserting again...\n";
+  }
+  #print "PlanSer: $PlanSer\n";
+
+
+}
+
+#------------------------------------------------------------------------
+# exit gently
+#------------------------------------------------------------------------
+exit;
+
+#------------------------------------------------------------------------
+# Function to read DVH data and write it into the DB
+#------------------------------------------------------------------------
+sub readDVH
+{
+  my $StructureSer;
+  my $endStructures = 0;
+  while(!$endStructures)
+  {
+    # First read the structure information
+    $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $NonStandardId= trim($cols[1]); #StructureName
+
+    # Determine the standard name for this structure and assign it to the StandardId variable for insertion
+
+ 
+    # If we get a blank line here then the end of the file has been reached - so return
+    if(trim($cols[0]) eq "Structure")
+    {
+      $skipline = <DVHDATA>; # skip 
+      $skipline = <DVHDATA>; # skip 
+      $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $CourseId = trim($cols[1]); #CourseId
+      $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $VolumeCC= trim($cols[1]); #
+      $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $DoseCoverPercent= trim($cols[1]); #
+      $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $SamplingCoverPercent= trim($cols[1]); #
+      $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $MinDoseGy= trim($cols[1]); #
+      $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $MaxDoseGy= trim($cols[1]); #
+      $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $MeanDoseGy= trim($cols[1]); #
+      $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $ModalDoseGy= trim($cols[1]); #
+      $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $MedianDoseGy= trim($cols[1]); #
+      $line = <DVHDATA>; chomp $line; @cols = split(/:/,$line); $STDDoseGy= trim($cols[1]); #
+      $skipline = <DVHDATA>; # skip 
+      $skipline = <DVHDATA>; # skip 
+      $skipline = <DVHDATA>; # skip 
+      $skipline = <DVHDATA>; # skip 
+      $skipline = <DVHDATA>; # skip 
+
+      #print "%NonStandardId: $NonStandardId\n";
+      #print "%StructureSer: $StructureSer\n";
+      #print "%CourseId: $CourseId\n";
+      #print "%lastSkippedLine: $skipline\n";
+
+      #------------------------------------------------------------------------
+      # Put the structure information into the databsae - should be safe to assume
+      # that if we got this far then this patient's plan data is not already in
+      # the database
+      #------------------------------------------------------------------------
+      # prepare SQL
+      my $InsertStructureSQL = "INSERT INTO Structures (PlanSer, StructureSer, NonStandardId, CourseId, VolumeCC, DoseCoverPercent, SamplingCoverPercent, MinDoseGy, MaxDoseGy, MeanDoseGy, ModalDoseGy, MedianDoseGy, STDDoseGy) VALUES (\"$PlanSer\", NULL,\"$NonStandardId\",\"$CourseId\",\"$VolumeCC\",\"$DoseCoverPercent\",\"$SamplingCoverPercent\",\"$MinDoseGy\",\"$MaxDoseGy\",\"$MeanDoseGy\",\"$ModalDoseGy\",\"$MedianDoseGy\",\"$STDDoseGy\")"; 
+
+      #print "InsertStructureSQL: $InsertStructureSQL\n";
+
+      # prepare query
+      my $query= $dbh_mysql->prepare($InsertStructureSQL)
+        or die "Couldn't prepare statement: " . $dbh_mysql->errstr;
+
+      # submit query
+      $query->execute()
+        or die "Couldn't execute statement: " . $query->errstr;
+
+      # Now retrieve the StructureSer
+      $StructureSer = $dbh_mysql->last_insert_id(undef, undef, undef, undef);
+
+      #------------------------------------------------------------------------
+      # Read the DVH data for this structure and insert into the database
+      #------------------------------------------------------------------------
+      my $keepReading = 1;
+      while($keepReading)
+      {
+        $line = <DVHDATA>; 
+        chomp $line; 
+        #print "line $line\n";
+        @cols = split(/\s+/,$line); 
+        $DoseGy= trim($cols[1]); #
+        $RelativeDose= trim($cols[2]); #
+        $PercentVol= ""; #
+        $PercentVol= trim($cols[3]); #
+
+        #print "%NonStandardId: $NonStandardId -- $DoseGy Gy, $RelativeDose %Presc, $PercentVol %TotVol\n";
+
+        # Insert into database and continue reading if the line is not blank
+        if($PercentVol ne "")
+        {
+          # Prepare insert SQL
+          my $InsertDVHSQL = "INSERT INTO DVHData (StructureSer, RelativeDose, DoseGy, PercentVol) VALUES (\"$StructureSer\",\"$RelativeDose\",\"$DoseGy\",\"$PercentVol\")"; 
+          #print "InsertDVHSQL: $InsertDVHSQL\n";
+
+          # prepare query
+          my $query= $dbh_mysql->prepare($InsertDVHSQL)
+            or die "Couldn't prepare statement: " . $dbh_mysql->errstr;
+
+          # submit query
+          $query->execute()
+            or die "Couldn't execute statement: " . $query->errstr;
+
+
+          $keepReading = 1;
+        }
+        else
+        {
+          $keepReading = 0;
+	  #print "No more DVH data to read --- moving to next structure\n";
+
+        }
+      } #end of DVH reading loop
+    }
+    else
+    {
+      $endStructures = 1;
+    }
+  }  
+}
+
+#------------------------------------------------------------------------
+# Trim whitespace from beginning or end of a string
+#------------------------------------------------------------------------
+sub trim($)
+{
+	my $string = shift;
+	$string =~ s/^\s+//;
+	$string =~ s/\s+$//;
+	return $string;
+}
+
+
+

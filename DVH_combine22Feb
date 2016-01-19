@@ -1,0 +1,614 @@
+#!/usr/bin/perl
+#------------------------------------------------------------------------
+# J.Kildea 05-FEB-13
+#------------------------------------------------------------------------
+# PERL-CGI-DBI script to extract DVH data from the MUHC MySQL database 
+# 
+# Input parameters: 	various	
+#------------------------------------------------------------------------
+# Declarations/initialisations
+#------------------------------------------------------------------------
+use strict;
+#use warnings;
+#use diagnostics;
+use CGI qw(:standard);
+use CGI::Carp qw(fatalsToBrowser);
+use Statistics::Basic qw(:all);
+
+#------------------------------------------------------------------------
+# Use the DBI module 
+#------------------------------------------------------------------------
+use DBI;
+use DBD::Sybase;
+use Date::Calc;
+#use Date::Calc qw( Standard_to_Business Today Business_to_Standard );  
+use Date::Calc qw(Decode_Month Today Now Decode_Date_US Today_and_Now Delta_DHMS Add_Delta_Days Delta_Days Date_to_Days Day_of_Week_to_Text Day_of_Week);  
+
+#------------------------------------------------------------------------
+# Important variables
+#------------------------------------------------------------------------
+my @today_and_now = Today_and_Now();
+my $compare_outfile = "/var/www/Documents/temp/compare.csv";
+
+#------------------------------------------------------------------------
+# Parse the input parameters 
+#------------------------------------------------------------------------
+my $verbose = 0;
+$verbose 		= param("verbose");
+my $PlanId		= param("PlanId");
+my $StructureId 	= param("StructureId");
+my $CompareFile		= param("CompareFile");
+my $CompareStructure	= param("CompareStructure");
+my $TomoCompare		= param("TomoCompare");
+
+#========================================================================
+# Connect to the databases - the initial connections, only done once 
+#========================================================================
+# MUHC MySQL database 
+my $muhcdb_host="localhost";
+my $muhcdb_database="DVHDB";
+my $muhcdb_user="readonly";
+my $muhcdb_password="readonly";
+
+my $dbh_mysql =  DBI->connect("DBI:mysql:database=$muhcdb_database;host=$muhcdb_host",$muhcdb_user,$muhcdb_password)
+    or die "Couldn't connect to MySQL database: " . DBI->errstr;
+
+#------------------------------------------------------------------------
+# Start the webpage feedback - always the same
+#------------------------------------------------------------------------
+print "Content-type: text/html\n\n";
+print "<head>\n";
+print "<title>MUHC Radiation Oncology Database Reports</title>\n";
+print "<script src=\"http://172.26.66.41/Documents/config/sorttable.js\"></script>\n";
+print "</head>\n";
+print "<body>\n";
+
+print "<img src=\"http://muhc.ca/sites/all/themes/muhc/logo.png\">";
+print "<h3>Department of Radiation Oncology</h3>";
+print "<hr>";
+
+print "<center><h2><u>McGill DVH Registry</u></h2></center>";
+#------------------- ACKEEM CODE SECTION BEGIN --------------------------
+# Subroutine to create a main menu 
+#menuBar();
+
+#------------------- ACKEEM CODE SECTION END ----------------------------
+print "<b>Time of report:</b> @today_and_now<br>\n"; 
+print "<hr>";
+
+#------------------------------------------------------------------------
+# In the event that we are comparing against a new DVH, read in the new DVH
+# file here and output it to a file that can be read by the PlotDVHData program
+#------------------------------------------------------------------------
+if($CompareFile)
+{
+  readCompare() if !$TomoCompare;
+
+  readCompareTomo() if $TomoCompare;
+
+}
+
+
+
+
+#------------------------------------------------------------------------
+# Extract the serial numbers of all the structures that we are interested in 
+#------------------------------------------------------------------------
+my $sql = "
+    SELECT  
+	Structures.StructureSer
+    FROM
+	Plan, Structures	
+    WHERE
+	    Plan.StandardId = \"$PlanId\" 
+	AND Structures.StandardId = \"$StructureId\"
+	AND Structures.PlanSer = Plan.PlanSer
+    ORDER BY
+	Structures.StructureSer
+          ";
+
+print "$sql\n" if $verbose;
+
+# prepare query
+my $query= $dbh_mysql->prepare($sql)
+  or die "Couldn't prepare statement: " . $dbh_mysql->errstr;
+
+# submit query
+$query->execute()
+  or die "Couldn't execute statement: " . $query->errstr;
+
+# Examine the data returned
+my @StructureSer;
+my $numStructures = 0;
+while(my @data = $query->fetchrow_array())
+{
+  print "Data: @data<br>" if $verbose;
+
+  $StructureSer[$numStructures] = $data[0]; 
+  $numStructures++;
+}
+
+print "Got $numStructures structures for the sum<br>" if $verbose;
+
+#------------------------------------------------------------------------
+# Open the csv output file that will hold the raw DVH data
+#------------------------------------------------------------------------
+my $dvh_outfile = "/var/www/Documents/temp/dvhdata_$StructureId.csv";
+open(DVHOUT, ">$dvh_outfile") || die "file $dvh_outfile does not exist or may has permissions problems";
+
+#------------------------------------------------------------------------
+# open the volume out data file to hold the volume data
+#------------------------------------------------------------------------
+my $vol_outfile = "/var/www/Documents/temp/voldata_$StructureId.csv";
+open(VOLOUT, ">$vol_outfile") || die "file $vol_outfile does not exist or may has permissions problems";
+
+#------------------------------------------------------------------------
+# Foreach StrcutureSer extract the DVH data and store in hashes
+#------------------------------------------------------------------------
+my $Structure;
+my %DVH_sum;
+my %DVH_rawdata;
+my %DVH_rawdata_stats;
+my $numStructures = 0;
+foreach $Structure (@StructureSer)
+{
+  my $sql = "
+      	SELECT  
+  		DVHData.DoseGy,	
+  		DVHData.PercentVol	
+    	FROM
+		DVHData 
+    	WHERE
+	    	DVHData.StructureSer = \"$Structure\" 
+    	ORDER BY
+		DVHData.DoseGy	
+          ";
+
+  print "$sql\n" if $verbose;
+
+  # prepare query
+  my $query= $dbh_mysql->prepare($sql)
+    or die "Couldn't prepare statement: " . $dbh_mysql->errstr;
+
+  # submit query
+  $query->execute()
+    or die "Couldn't execute statement: " . $query->errstr;
+
+  # Examine the data returned
+  my $Dose;
+  my $PercentVol;
+  while(my @data = $query->fetchrow_array())
+  {
+    print "Data: @data<br>" if $verbose;
+
+    $Dose 	= $data[0]; 
+    $PercentVol = $data[1]; 
+
+    #print "Dose: $Dose, PercentVol: $PercentVol<br>";
+      
+    $DVH_sum{$Dose} += $PercentVol;
+
+    # Data for excel - use recursively-generated rows for the spreadsheet
+    $DVH_rawdata{$Dose} = "$DVH_rawdata{$Dose},$PercentVol";
+    $DVH_rawdata_stats{$Dose} = "$DVH_rawdata_stats{$Dose}$PercentVol,";
+  }
+  $numStructures++;
+}
+
+my $dose_val = 0;
+#for(;$dose_val<=10;)
+for $dose_val (sort {$a<=>$b} keys %DVH_rawdata)
+{
+  print DVHOUT "$dose_val$DVH_rawdata{$dose_val}\n";
+}
+
+close DVHOUT;
+
+#------------------------------------------------------------------------
+# For each structure determine the volume of the structure - to be used 
+# in a volume histogram
+#------------------------------------------------------------------------
+foreach $Structure (@StructureSer)
+{
+  my $sqlvolCC = "
+      	SELECT  
+  		Structures.VolumeCC	
+    	FROM
+		Structures	
+    	WHERE
+	    	Structures.StructureSer = \"$Structure\" 
+          ";
+
+  print "$sqlvolCC\n" if $verbose;
+
+  # prepare query
+  my $query= $dbh_mysql->prepare($sqlvolCC)
+    or die "Couldn't prepare statement: " . $dbh_mysql->errstr;
+
+  # submit query
+  $query->execute()
+    or die "Couldn't execute statement: " . $query->errstr;
+
+  # Examine the data returned
+  my $VolumeCC = $query->fetchrow_array();
+
+  #print "VolumeCC: $VolumeCC<br>";
+
+  # Store in the VOLOUT file for later plotting
+  print VOLOUT "$VolumeCC 1\n";
+}
+close VOLOUT;
+
+#------------------------------------------------------------------------
+# Open the temporary output file that will be used as input to the plotting program
+#------------------------------------------------------------------------
+my $outfile = "/usr/lib/cgi-bin/dev/temp/data/dvh.dat";
+open(OUT, ">$outfile") || die "file $outfile does not exist or may has permissions problems";
+
+#------------------------------------------------------------------------
+# Calculate the average DVH and plot
+#------------------------------------------------------------------------
+my $dose_val;
+my %DVH_mean;
+my %DVH_median;
+my %DVH_stdev;
+my %DVH_mean_stats;
+foreach $dose_val (keys %DVH_sum)
+{
+  $DVH_mean{$dose_val} = $DVH_sum{$dose_val}/$numStructures;
+
+  #print "$dose_val, $DVH_mean{$dose_val} <br>"; 
+  print OUT "$dose_val $DVH_mean{$dose_val}\n";
+
+  $DVH_mean{$dose_val} = sprintf("%2.0f",$DVH_mean{$dose_val});
+
+  # Get stats using Statistics::Basic package
+  chop($DVH_rawdata_stats{$dose_val}); # remove final ,
+  
+  # convert stats from a string to an array of numbers
+  my @stat_values_this_dose = split(/,/,$DVH_rawdata_stats{$dose_val});
+
+  # calculate mean for this dose 
+  $DVH_mean_stats{$dose_val} = mean(@stat_values_this_dose);
+  $DVH_mean_stats{$dose_val} = sprintf("%2.0f",$DVH_mean_stats{$dose_val});
+
+  # calculate mean for this dose
+  $DVH_median{$dose_val} = median(@stat_values_this_dose);
+  $DVH_median{$dose_val} = sprintf("%2.0f",$DVH_median{$dose_val});
+
+  # calculate stdev for this dose
+  $DVH_stdev{$dose_val} = stddev(@stat_values_this_dose);
+  $DVH_stdev{$dose_val} = sprintf("%2.0f",$DVH_stdev{$dose_val});
+
+}
+close OUT;
+
+print "<center><h2>Mean $StructureId DVH for $PlanId plans</h2>";
+
+print "Click <a href=\"http://172.26.66.41/Documents/temp/dvhdata_$StructureId.csv\">here</a> for raw DVH data in .csv format</br>";
+
+print "Number of structures used to calculate average: $numStructures<br>";
+
+# Plot the average DVH using PlotScatter - may or may not be displayed below
+system(qq{env SHELL=/bin/tcsh /usr/lib/cgi-bin/dev/plotters/PlotScatter/PlotScatter -f $outfile -Y Volume -y % -X Dose -x Gy -o dvh -T "Average $StructureId for $PlanId"}); 
+
+# Plot the structure histogram using PlotHist
+#print(qq{env SHELL=/bin/tcsh /usr/lib/cgi-bin/dev/plotters/PlotHist/PlotHist -f /var/www/Documents/temp/voldata_Liver.csv -q "Volume" -Y "Number" -u "cc" -T "Structure Volume Distribution" -n 100 -o /var/www/Documents/temp/ <br>}); 
+
+system(qq{env SHELL=/bin/tcsh /usr/lib/cgi-bin/dev/plotters/PlotHist/PlotHist -f $vol_outfile -q "Volume" -Y "Number" -u "cc" -T "Structure Volume Distribution" -n 10 -o /var/www/Documents/temp/}); 
+
+# Plot the DVH data using PlotDVHData - compare with present data or not, as appropriate
+system(qq{env SHELL=/bin/tcsh /usr/lib/cgi-bin/dev/plotters/PlotDVHData/PlotDVHData -f $dvh_outfile -S "$StructureId" -X Dose -x Gy -Y Volume -y % -D 5}) if !$CompareFile; 
+
+system(qq{env SHELL=/bin/tcsh /usr/lib/cgi-bin/dev/plotters/PlotDVHData/PlotDVHData -f $dvh_outfile -S "$StructureId" -X Dose -x Gy -Y Volume -y % -D 5 -c $compare_outfile}) if $CompareFile; 
+
+# Show the plot
+#print "<img src=\"http://172.26.66.41/Documents/temp/dvh_scatter.png\">";
+print "<img src=\"http://172.26.66.41/Documents/temp/Volume_hist.png\"><br>";
+print "<img src=\"http://172.26.66.41/Documents/temp/_DVHData.png\">";
+print "<p>";
+
+#------------------------------------------------------------------------
+# Print the means and standard deviations of specific points
+#------------------------------------------------------------------------
+print "<table border=\"1\" width=\"35%\ cellpadding=\"0\" cellspacing=\"0\" class=\"sortable\">\n";
+print "<tr bgcolor=#33CCFF>\n";
+print "<th colspan=6>Derived Constraints for $StructureId</th>";
+print "</tr>";
+print "<tr>\n";
+print " 	<th width=\"25%\" align=\"left\">Constraint (Gy)</th>\n"; 
+print " 	<th width=\"5%\" align=\"left\">V5</th>\n"; 
+print " 	<th width=\"5%\" align=\"left\">V10</th>\n"; 
+print " 	<th width=\"5%\" align=\"left\">V20</th>\n"; 
+print " 	<th width=\"5%\" align=\"left\">V30</th>\n"; 
+print " 	<th width=\"5%\" align=\"left\">V35</th>\n"; 
+print "</tr>";
+print "<tr>\n";
+print " 	<td widtd=\"25%\" align=\"left\">Mean Volume (%)</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_mean{\"5\"}</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_mean{\"10\"}</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_mean{\"20\"}</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_mean{\"30\"}</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_mean{\"35\"}</td>\n"; 
+print "</tr>";
+print "<tr>\n";
+print " 	<td widtd=\"25%\" align=\"left\">Median Volume (%)</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_median{\"5\"}</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_median{\"10\"}</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_median{\"20\"}</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_median{\"30\"}</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_median{\"35\"}</td>\n"; 
+print "</tr>";
+print "<tr>\n";
+print " 	<td widtd=\"25%\" align=\"left\">Standard Deviation Volume (%)</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_stdev{\"5\"}</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_stdev{\"10\"}</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_stdev{\"20\"}</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_stdev{\"30\"}</td>\n"; 
+print " 	<td widtd=\"5%\" align=\"left\">$DVH_stdev{\"35\"}</td>\n"; 
+print "</tr>";
+print "</table>";
+#print "Mean V5 = $DVH_mean{\"5\"}%<br>";
+#print "Mean V10 = $DVH_mean{\"10\"}%<br>";
+#print "Mean V20 = $DVH_mean{\"20\"}%<br>";
+#print "Mean V30 = $DVH_mean{\"30\"}%<br>";
+#print "Mean V35 = $DVH_mean{\"35\"}%<br>";
+
+print "</center>";
+
+
+
+
+
+
+#------------------------------------------------------------------------
+# exit gently
+#------------------------------------------------------------------------
+exit;
+
+#------------------------------------------------------------------------
+# Subroutine for sorting numerically
+#------------------------------------------------------------------------
+sub hashValueDescendingNum 
+{
+  $DVH_rawdata{$b} <=> $DVH_rawdata{$a};
+}
+
+
+#------------------------------------------------------------------------
+# subroutine to read in the compare DVH file and output it into a file
+# that can be read in by the PlotDVHData program
+#------------------------------------------------------------------------
+sub readCompare
+{
+  #------------------------------------------------------------------------
+  # Open the compare input and output file 
+  #------------------------------------------------------------------------
+  open(COMPDATA, "$CompareFile") || die "file $CompareFile does not exist";
+
+  open(COMPOUT, ">$compare_outfile") || die "file $compare_outfile does not exist or may has permissions problems";
+
+  my $line;
+  my @cols;
+  my ($PatientId, $NonStandardId, $PrescDose, $PercentIso, $NonStandardId, $CourseId, $skipline);
+  my ($VolumeCC,$DoseCoverPercent,$SamplingCoverPercent,$MinDoseGy,$MaxDoseGy,$MeanDoseGy,$ModalDoseGy,$MedianDoseGy,$STDDoseGy); 
+  my ($DoseGy,$RelativeDose,$PercentVol);
+
+  # Read the header
+  $skipline = <COMPDATA>; # skip the patient name
+  $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $PatientId = trim($cols[1]); #Patient Id as PatientId
+  $skipline = <COMPDATA>; # skip comment 
+  $skipline = <COMPDATA>; # skip date
+  $skipline = <COMPDATA>; # skip type
+  $skipline = <COMPDATA>; # skip desc 1
+  $skipline = <COMPDATA>; # skip desc 2
+  $skipline = <COMPDATA>; # skip desc 3
+  $skipline = <COMPDATA>; # blank line 
+  $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $NonStandardId = trim($cols[1]); #plan name
+  $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $PrescDose = trim($cols[1]); #Presc Dose
+  $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $PercentIso = trim($cols[1]); #Presc Isodose line
+  $skipline = <COMPDATA>; # blank line 
+
+  #print "PatientId: $PatientId\n";
+  #print "Plan name: $NonStandardId\n";
+  #print "Prescribed Dose (Gy): $PrescDose\n";
+  #print "%Iso: $PercentIso\n";
+
+  my $StructureSer;
+  my $endStructures = 0;
+  while(!$endStructures)
+  {
+    # First read the structure information
+    $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $NonStandardId= trim($cols[1]); #StructureName
+
+    # If we get a blank line here then the end of the file has been reached - so return
+    if(trim($cols[0]) eq "Structure")
+    {
+      $skipline = <COMPDATA>; # skip 
+      $skipline = <COMPDATA>; # skip 
+      $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $CourseId = trim($cols[1]); #CourseId
+      $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $VolumeCC= trim($cols[1]); #
+      $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $DoseCoverPercent= trim($cols[1]); #
+      $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $SamplingCoverPercent= trim($cols[1]); #
+      $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $MinDoseGy= trim($cols[1]); #
+      $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $MaxDoseGy= trim($cols[1]); #
+      $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $MeanDoseGy= trim($cols[1]); #
+      $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $ModalDoseGy= trim($cols[1]); #
+      $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $MedianDoseGy= trim($cols[1]); #
+      $line = <COMPDATA>; chomp $line; @cols = split(/:/,$line); $STDDoseGy= trim($cols[1]); #
+      $skipline = <COMPDATA>; # skip 
+      $skipline = <COMPDATA>; # skip 
+      $skipline = <COMPDATA>; # skip 
+      $skipline = <COMPDATA>; # skip 
+      $skipline = <COMPDATA>; # skip 
+
+      #print "%NonStandardId: $NonStandardId<br>";
+      #print "%CompareStructure: $CompareStructure<br>";
+      #print "%CourseId: $CourseId<br>";
+      #print "%lastSkippedLine: $skipline<br>";
+
+      #------------------------------------------------------------------------
+      # Read the DVH data for this structure and output to the compare file 
+      #------------------------------------------------------------------------
+      my $keepReading = 1;
+      while($keepReading)
+      {
+        $line = <COMPDATA>; 
+        chomp $line; 
+        #print "line $line\n";
+        @cols = split(/\s+/,$line); 
+        $DoseGy= trim($cols[1]); #
+        $RelativeDose= trim($cols[2]); #
+        $PercentVol= ""; #
+        $PercentVol= trim($cols[3]); #
+
+        #print "%NonStandardId: $NonStandardId -- $DoseGy Gy, $RelativeDose %Presc, $PercentVol %TotVol<br>";
+
+        # Output to the COMPOUT file if we are on the correct structure  
+        if($PercentVol ne "")
+        {
+
+	  if($NonStandardId eq $CompareStructure)
+      	  {
+            #print "$DoseGy $PercentVol<br>";
+            print COMPOUT "$DoseGy $PercentVol\n";
+	  }
+
+          $keepReading = 1;
+        }
+        else
+        {
+          $keepReading = 0;
+	  #print "No more DVH data to read --- moving to next structure\n";
+
+        }
+      } #end of DVH reading loop
+    }
+    else
+    {
+      $endStructures = 1;
+    }
+  }  
+  close COMPOUT;
+}
+
+#------------------------------------------------------------------------
+# Read in Tomo DVH file for comparison
+#------------------------------------------------------------------------
+sub readCompareTomo
+{
+  print "Tomo readCompare<br>";
+
+  #------------------------------------------------------------------------
+  # Open the compare input and output file 
+  #------------------------------------------------------------------------
+  open(COMPDATA, "$CompareFile") || die "file $CompareFile does not exist";
+
+  open(COMPOUT, ">$compare_outfile") || die "file $compare_outfile does not exist or may has permissions problems";
+
+  # read in the first line - gives us the field information
+  my $line;
+  my $lineNum = 0;
+  my @cols;
+  my $NonStandardId;
+  my $DosePos;
+  my $VolPos;
+  while($line = <COMPDATA>)
+  {
+    chomp $line; 
+
+    # remove the "
+    $line =~ s/"//g;
+
+    # remove the (STANDARD)
+    $line =~ s/\(STANDARD\)//g;
+
+    @cols = split(/,/,$line); 
+
+
+    # if this is the first line, determine which columns we are interested in
+    my $colNum;
+    if($lineNum == 0)
+    {
+      foreach $NonStandardId (@cols)
+      {
+        #print "NonStandardId: $NonStandardId<br>";
+        if($NonStandardId eq $CompareStructure)
+        {
+          $DosePos = $colNum+1;
+          $VolPos = $colNum+2;
+
+          #print "Dose for $NonStandardId is at position $DosePos<br>";
+          #print "Volume for $NonStandardId is at position $VolPos<br>";
+        }
+        $colNum++;
+      }
+    }
+    else # read in just the data we are interested in and output it immediately
+    {
+      my $DoseGy = $cols[$DosePos];
+      my $PercentVol = $cols[$VolPos];
+      #print "$DoseGy $PercentVol<br>"; 
+      print COMPOUT "$DoseGy $PercentVol\n"; 
+    }
+
+    $lineNum++;
+  } # end of line reading loop
+
+  
+
+
+}
+
+
+#------------------------------------------------------------------------
+# Trim whitespace from beginning or end of a string
+#------------------------------------------------------------------------
+sub trim($)
+{
+	my $string = shift;
+	$string =~ s/^\s+//;
+	$string =~ s/\s+$//;
+	return $string;
+}
+
+#--------------------- ACKEEM CODE SECTION BEGIN ------------------------
+
+#------------------------------------------------------------------------
+# menuBar function - Displays a main menu of links
+#------------------------------------------------------------------------
+sub menuBar
+{
+	print "
+		<center>
+		<table style=\" text-align: center; width: 500px;\">
+		<tbody>
+			<tr>
+				<td colspan=\"3\" style=\"background-color: rgb(219,219,219);\">
+					<span style=\"font-weight: bold\">ACKEEM TEST MAIN MENU</span>
+				</td>
+			</tr>
+			<tr>
+				<td onclick=\"history.go(-2);return true;\" onmouseover=\"this.bgColor='#EE3124'; this.style.color='white'\" onmouseout=\"this.bgColor='#FAEFEF'; this.style.color='black'\">
+					Plan List
+				</td>
+				<td onclick=\"history.go(-1);return true;\" onmouseover=\"this.bgColor='#EE3124'; this.style.color='white'\" onmouseout=\"this.bgColor='#FAEFEF'; this.style.color='black'\">
+					Structure List
+				</td>
+				<td onclick=\"history.go(0);return true;\" onmouseover=\"this.bgColor='#EE3124'; this.style.color='white'\" onmouseout=\"this.bgColor='#FAEFEF'; this.style.color='black'\">
+					Refresh Page
+				</td>
+			</tr>
+		</tbody>
+		</table>
+		</center>
+	";
+}
+
+#--------------------- ACKEEM CODE SECTION END --------------------------
+
+
+
+
+
+

@@ -1,0 +1,156 @@
+#!/usr/bin/perl
+#------------------------------------------------------------------------
+# J.Kildea 7-FEB-2013 
+#------------------------------------------------------------------------
+# PERL-CGI-DBI script to standardise DVH names in the DVHDB database at 
+# the MUHC 
+# 
+# Input parameters: 	various	
+#------------------------------------------------------------------------
+# Declarations/initialisations
+#------------------------------------------------------------------------
+use strict;
+#use warnings;
+#use diagnostics;
+#use CGI qw(:standard);
+#use CGI::Carp qw(fatalsToBrowser);
+
+#------------------------------------------------------------------------
+# Use the DBI module 
+#------------------------------------------------------------------------
+use DBI;
+use DBD::Sybase;
+use Date::Calc;
+#use Date::Calc qw( Standard_to_Business Today Business_to_Standard );  
+use Date::Calc qw(Decode_Month Today Now Decode_Date_US Today_and_Now Delta_DHMS Add_Delta_Days Delta_Days);  
+
+#------------------------------------------------------------------------
+# Important variables
+#------------------------------------------------------------------------
+my $help;
+my $structures;
+my $plans;
+my $line;
+my $filename;
+my @cols;
+
+#------------------------------------------------------------------------
+# Read in the command line arguments
+#------------------------------------------------------------------------
+use Getopt::Long;
+&GetOptions("h"	     => \$help,
+	    "help"   => \$help,
+	    "structures" => \$structures,
+	    "plans" => \$plans,
+	    "filename=s" => \$filename
+	   );
+
+#------------------------------------------------------------------------
+# Process the command line input
+# if there are no command line arguments then say so and die!
+#------------------------------------------------------------------------
+if ($help || (!$structures && !$plans &&!$help && !$filename) || ( ($structures ||$plans) && !$filename  ))
+{
+die "DVH_rename: too few arguments\n
+
+Usage:
+	DVH_rename 	--structures
+		 	--plans
+			--filename
+		\n";
+}
+
+#------------------------------------------------------------------------
+# Connect to the MUHC MySQL database 
+#------------------------------------------------------------------------
+my $muhcdb_host="localhost";
+my $muhcdb_database="DVHDB";
+my $muhcdb_user="readonly";
+my $muhcdb_password="readonly";
+
+my $dbh_mysql =  DBI->connect("DBI:mysql:database=$muhcdb_database;host=$muhcdb_host",$muhcdb_user,$muhcdb_password)
+    or die "Couldn't connect to database: " . DBI->errstr;
+
+
+#------------------------------------------------------------------------
+# Determine the table to change based on the input
+#------------------------------------------------------------------------
+my $table;
+
+$table = "Structures" if $structures;
+$table = "Plan" if $plans;
+
+#------------------------------------------------------------------------
+# Read in the DVH data and update the database
+#------------------------------------------------------------------------
+open(RULES, "$filename") || die "file $filename does not exist";
+
+
+
+
+while($line = <RULES>)
+{
+  chomp $line; 
+  @cols = split(/,/,$line); 
+  my $NonStandardId	= trim($cols[0]); #
+  my $StandardId 	= trim($cols[1]); #
+  my $Exception1		= trim($cols[2]); #
+  my $Exception2		= trim($cols[3]); #
+  my $Exception3		= trim($cols[4]); #
+  my $Exception4		= trim($cols[5]); #
+  my $Exception5		= trim($cols[6]); #
+
+  #print "Exception1: $Exception1\n";
+  my $Exception = "";
+  $Exception = $Exception1 if $Exception1;
+  $Exception = "$Exception%\" AND NonStandardId NOT LIKE \"%$Exception2" if $Exception2;
+  $Exception = "$Exception%\" AND NonStandardId NOT LIKE \"%$Exception3" if $Exception3;
+  $Exception = "$Exception%\" AND NonStandardId NOT LIKE \"%$Exception4" if $Exception4;
+  $Exception = "$Exception%\" AND NonStandardId NOT LIKE \"%$Exception5" if $Exception5;
+
+  my $StandardUpdateSQL;
+
+  if($Exception)
+  {
+    print "Will replace all $table like \"*$NonStandardId*\" with \"$StandardId\" expect structures like $Exception\n";
+    $StandardUpdateSQL = "UPDATE $table SET StandardId = \"$StandardId\" WHERE NonStandardId LIKE \"%$NonStandardId%\" AND NonStandardId NOT LIKE \"%$Exception%\"";
+  }
+  else 
+  {
+    print "Will replace all $table like \"*$NonStandardId*\" with \"$StandardId\"\n";
+    $StandardUpdateSQL = "UPDATE $table SET StandardId = \"$StandardId\" WHERE NonStandardId LIKE \"%$NonStandardId%\"";
+  }
+
+  # Update the database
+
+  print "$StandardUpdateSQL\n";
+
+  # prepare query
+  my $query= $dbh_mysql->prepare($StandardUpdateSQL)
+    or die "Couldn't prepare statement: " . $dbh_mysql->errstr;
+
+  # submit query
+  $query->execute()
+    or die "Couldn't execute statement: " . $query->errstr;
+}
+
+
+#------------------------------------------------------------------------
+# exit gently
+#------------------------------------------------------------------------
+exit;
+
+
+#------------------------------------------------------------------------
+# Trim whitespace from beginning or end of a string
+#------------------------------------------------------------------------
+sub trim($)
+{
+	my $string = shift;
+	$string =~ s/^\s+//;
+	$string =~ s/\s+$//;
+	return $string;
+}
+
+
+
